@@ -1,0 +1,1483 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+pyenv-finder - find and categorise every Python environment on this computer.
+
+READ-ONLY: this program never modifies, deletes or installs anything.
+It only reads files/folders and runs harmless "--version" / "conda env list"
+commands. The only files it writes are the report files you ask for with 'e'
+(or --export): ~/pyenv-finder-report.txt and ~/pyenv-finder-report.json.
+
+Standard library only (Python 3.6+). Manual: ~/Documents/pyenv-finder-MANUAL.md
+"""
+import argparse
+import glob
+import json
+import locale
+import os
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+APP_VERSION = "1.0"
+HOME = os.path.realpath(os.path.expanduser("~"))
+REPORT_TXT = os.path.join(HOME, "pyenv-finder-report.txt")
+REPORT_JSON = os.path.join(HOME, "pyenv-finder-report.json")
+READ_ONLY_NOTE = "READ-ONLY: never modifies, deletes or installs anything"
+
+PY_RE = re.compile(r"^python(\d+(\.\d+)?)?$")
+VER_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?([a-z]+\d*)?")
+
+# Directory names never descended into while searching
+SKIP_NAMES = {
+    "node_modules", ".git", ".hg", ".svn", "__pycache__", "site-packages",
+    "dist-packages", ".cache", "cache", "Cache", "Code Cache", "GPUCache",
+    "DawnCache", "GrShaderCache", "ShaderCache", "CacheStorage", "Service Worker",
+    "IndexedDB", "blob_storage", ".npm", ".cargo", ".rustup", ".gradle", ".m2",
+    ".steam", "Steam", "steamapps", ".wine", "Trash", ".Trash-1000", "proc", "sys",
+    ".thumbnails", "lost+found", ".nv", "Crashpad", "WebStorage",
+}
+# Absolute paths never descended into
+SKIP_PATHS = {
+    os.path.join(HOME, p) for p in (
+        ".cache", ".steam", ".local/share/Steam", ".local/share/Trash", ".wine",
+        ".var/app/com.valvesoftware.Steam", ".local/share/flatpak",
+        ".mozilla", ".thunderbird", "snap/steam", ".npm", ".nvm/.cache",
+        ".local/share/containers", ".docker",
+    )
+} | {
+    "/proc", "/sys", "/dev", "/run", "/usr/share", "/usr/include", "/usr/src",
+    "/usr/lib/modules", "/usr/lib/firmware", "/usr/lib/debug", "/usr/lib/jvm",
+    "/usr/lib/x86_64-linux-gnu", "/usr/libexec", "/usr/lib32", "/usr/libx32",
+    "/var/lib/flatpak",  # handled separately (targeted look-ups)
+    "/snap",             # handled separately
+}
+
+NOTABLE = [
+    "jupyterlab", "notebook", "jupyter", "ipykernel", "torch", "tensorflow",
+    "keras", "jax", "numpy", "pandas", "scipy", "matplotlib", "scikit-learn",
+    "transformers", "open-webui", "gptme", "langchain", "openai", "django",
+    "flask", "fastapi", "opencv-python", "pyqt5", "pyside6",
+]
+PROGRAM_PACKAGES = {
+    "open-webui": "Open WebUI", "gptme": "gptme", "jupyterlab": "JupyterLab",
+    "notebook": "Jupyter Notebook", "comfyui": "ComfyUI", "mycroft-core": "Mycroft",
+    "ovos-core": "OpenVoiceOS", "spyder": "Spyder", "anaconda-navigator": "Anaconda Navigator",
+    "aider-chat": "aider", "open-interpreter": "Open Interpreter",
+}
+
+CAT_ORDER = ["System", "Local", "Conda", "pipx", "uv", "pyenv", "Virtual",
+             "Flatpak", "Snap", "Application", "Other", "Game", "Broken"]
+
+
+# ----------------------------------------------------------------- helpers
+def safe(s):
+    """Make any string printable (bad bytes / surrogates become '?')."""
+    if s is None:
+        return ""
+    s = str(s)
+    try:
+        s.encode("utf-8")
+        return s
+    except UnicodeEncodeError:
+        return s.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
+def tilde(p):
+    if not p:
+        return ""
+    if p == HOME:
+        return "~"
+    if p.startswith(HOME + os.sep):
+        return "~" + p[len(HOME):]
+    return p
+
+
+def human(n):
+    if n is None:
+        return "-"
+    f = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if f < 1024 or unit == "TB":
+            return ("%d %s" % (f, unit)) if unit == "B" else ("%.1f %s" % (f, unit))
+        f /= 1024.0
+
+
+def isdir(p):
+    try:
+        return os.path.isdir(p)
+    except (OSError, ValueError):
+        return False
+
+
+def isfile(p):
+    try:
+        return os.path.isfile(p)
+    except (OSError, ValueError):
+        return False
+
+
+def real(p):
+    try:
+        return os.path.realpath(p)
+    except (OSError, ValueError):
+        return p
+
+
+def inside(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def read_text(p, limit=200000):
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(limit)
+    except (OSError, ValueError):
+        return ""
+
+
+def ver_key(v):
+    m = VER_RE.search(v or "")
+    if not m:
+        return (0, 0, 0)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
+def is_exec_file(path):
+    try:
+        st = os.stat(path)  # follows symlinks
+    except OSError:
+        return None  # dead symlink / unreadable
+    return stat.S_ISREG(st.st_mode) and bool(st.st_mode & 0o111)
+
+
+def run_cmd(args, timeout=5):
+    env = dict(os.environ)
+    for k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+        env.pop(k, None)
+    try:
+        p = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=timeout, env=env)
+        return p.returncode, (p.stdout or b"").decode("utf-8", "replace"), \
+            (p.stderr or b"").decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return None, "", "timeout"
+    except (OSError, ValueError) as e:
+        return None, "", str(e)
+
+
+# --------------------------------------------------------------- the scan
+class Progress:
+    def __init__(self, cb=None):
+        self.cb = cb
+        self.dirs = 0
+        self.found = 0
+        self.errors = 0
+        self.phase = ""
+        self._last = 0.0
+
+    def tick(self, where="", force=False):
+        now = time.monotonic()
+        if self.cb and (force or now - self._last > 0.08):
+            self._last = now
+            self.cb(self, where)
+
+
+class Scanner:
+    def __init__(self, do_size=True, run_python=True, progress_cb=None,
+                 max_depth=14, size_budget=25.0):
+        self.do_size = do_size
+        self.run_python = run_python
+        self.max_depth = max_depth
+        self.size_budget = size_budget
+        self.p = Progress(progress_cb)
+        self.venvs = set()
+        self.conda_prefixes = set()
+        self.interps = {}          # found path -> None
+        self.conda_listed = {}     # prefix -> base root that listed it
+        self.conda_missing = []    # (prefix, source)
+        self.conda_tools = {}
+        self.notes = []
+
+    # ---- walking
+    def walk(self, root):
+        if not isdir(root):
+            return
+        stack = [(root, 0)]
+        while stack:
+            d, depth = stack.pop()
+            self.p.dirs += 1
+            self.p.tick(d)
+            try:
+                with os.scandir(d) as it:
+                    entries = list(it)
+            except (PermissionError, FileNotFoundError, NotADirectoryError):
+                self.p.errors += 1
+                continue
+            except OSError:
+                self.p.errors += 1
+                continue
+            names = {}
+            for e in entries:
+                names[e.name] = e
+            e = names.get("pyvenv.cfg")
+            if e is not None and _is_file(e):
+                self.venvs.add(d)
+                self.p.found += 1
+                continue
+            e = names.get("conda-meta")
+            if e is not None and _is_dir(e):
+                self.conda_prefixes.add(d)
+                self.p.found += 1
+                envs = os.path.join(d, "envs")
+                if isdir(envs):
+                    stack.append((envs, depth + 1))
+                continue
+            for e in entries:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        if e.name in SKIP_NAMES or e.path in SKIP_PATHS:
+                            continue
+                        if e.name.startswith(".mount_"):
+                            continue
+                        if depth < self.max_depth:
+                            stack.append((e.path, depth + 1))
+                    elif PY_RE.match(e.name):
+                        self.interps[e.path] = None
+                except OSError:
+                    self.p.errors += 1
+
+    def targeted(self):
+        # system python binaries
+        for d in ("/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin"):
+            for p in glob.glob(os.path.join(d, "python*")):
+                if PY_RE.match(os.path.basename(p)):
+                    self.interps[p] = None
+        # flatpak apps and runtimes (system + user installation)
+        for base in ("/var/lib/flatpak", os.path.join(HOME, ".local/share/flatpak")):
+            for kind in ("app", "runtime"):
+                for files in glob.glob(os.path.join(base, kind, "*", "*", "*", "active", "files")):
+                    self.p.tick(files)
+                    for sub in ("bin", "usr/bin", "lib/*/bin", "*/bin"):
+                        for p in glob.glob(os.path.join(files, sub, "python*")):
+                            if PY_RE.match(os.path.basename(p)):
+                                self.interps[p] = None
+                    for v in glob.glob(os.path.join(files, "*", "pyvenv.cfg")) + \
+                            glob.glob(os.path.join(files, "*", "*", "pyvenv.cfg")):
+                        self.venvs.add(os.path.dirname(v))
+        # snaps
+        for p in glob.glob("/snap/*/current/usr/bin/python*") + glob.glob("/snap/*/current/bin/python*"):
+            if PY_RE.match(os.path.basename(p)):
+                self.interps[p] = None
+        # everything on PATH
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if d and isdir(d):
+                for p in glob.glob(os.path.join(glob.escape(d), "python*")):
+                    if PY_RE.match(os.path.basename(p)):
+                        self.interps[p] = None
+
+    def conda_discovery(self):
+        """Find conda/mamba/micromamba installs and ask them for their env lists."""
+        cands = set()
+        for n in ("miniconda3", "miniconda", "miniconda2", "anaconda3", "anaconda",
+                  "anaconda2", "miniforge3", "mambaforge", "micromamba", ".micromamba",
+                  "conda", ".conda", "mamba", ".local/share/mamba", ".local/share/micromamba"):
+            for b in (HOME, "/opt", "/usr/local"):
+                p = os.path.join(b, n)
+                if isdir(p):
+                    cands.add(p)
+        for var in ("CONDA_PREFIX", "CONDA_ROOT", "MAMBA_ROOT_PREFIX", "CONDA_EXE", "MAMBA_EXE"):
+            v = os.environ.get(var)
+            if v:
+                if var.endswith("_EXE"):
+                    v = os.path.dirname(os.path.dirname(v))
+                cands.add(v)
+        mrc = read_text(os.path.join(HOME, ".mambarc")) + read_text(os.path.join(HOME, ".condarc"))
+        for m in re.finditer(r"root_prefix:\s*(\S+)", mrc):
+            cands.add(os.path.expanduser(m.group(1)))
+        for c in cands:
+            if isdir(os.path.join(c, "conda-meta")):
+                self.conda_prefixes.add(c)
+            envs = os.path.join(c, "envs")
+            if isdir(envs):
+                self.walk(envs)
+        # environments.txt files written by conda/mamba
+        for f in (os.path.join(HOME, ".conda", "environments.txt"),
+                  os.path.join(HOME, ".mamba", "environments.txt")):
+            for line in read_text(f).splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if isdir(os.path.join(line, "conda-meta")):
+                    self.conda_prefixes.add(line)
+                else:
+                    self.conda_missing.append((line, tilde(f)))
+        # tools on PATH
+        for t in ("conda", "mamba", "micromamba"):
+            w = shutil.which(t)
+            if w:
+                self.conda_tools[t] = w
+
+    def ask_conda(self, roots):
+        """Run '<root>/bin/conda env list --json' (read-only) for each base install."""
+        exes = []
+        for r in roots:
+            for rel in ("bin/conda", "condabin/conda", "bin/mamba", "bin/micromamba"):
+                e = os.path.join(r, rel)
+                if is_exec_file(e):
+                    exes.append((r, e))
+                    break
+        mm = self.conda_tools.get("micromamba")
+        if mm:
+            exes.append((None, mm))
+        for root, exe in exes:
+            self.p.phase = "asking conda: " + tilde(exe)
+            self.p.tick(exe, force=True)
+            rc, out, err = run_cmd([exe, "env", "list", "--json"], timeout=25)
+            if rc != 0:
+                self.notes.append("'%s env list' failed: %s" % (tilde(exe), (err or "?").strip()[:120]))
+                continue
+            try:
+                data = json.loads(out[out.find("{"):])
+            except ValueError:
+                continue
+            for env in data.get("envs", []):
+                if isdir(os.path.join(env, "conda-meta")):
+                    self.conda_prefixes.add(env)
+                    if root:
+                        self.conda_listed.setdefault(real(env), real(root))
+                else:
+                    self.conda_missing.append((env, tilde(exe) + " env list"))
+
+    # ---- main entry
+    def scan(self):
+        t0 = time.monotonic()
+        self.p.phase = "searching"
+        roots = [HOME, "/opt", "/usr", "/usr/local", "/srv"]
+        self.targeted()
+        self.conda_discovery()
+        for r in roots:
+            self.p.phase = "searching " + r
+            self.walk(r)
+        # conda bases found -> ask them
+        bases = set()
+        for c in self.conda_prefixes:
+            if is_exec_file(os.path.join(c, "bin", "conda")) or isdir(os.path.join(c, "condabin")) \
+                    or isdir(os.path.join(c, "envs")):
+                bases.add(c)
+        self.ask_conda(sorted(bases))
+        self.p.phase = "analysing"
+        self.p.tick("", force=True)
+        envs = self.build()
+        self.p.phase = "versions"
+        self.p.tick("", force=True)
+        self.fill_versions(envs)
+        for e in envs:
+            finalize(e)
+        if self.do_size:
+            self.fill_sizes(envs)
+        mark_path(envs)
+        for e in envs:
+            for k in [k for k in e if k.startswith("_")]:
+                e.pop(k, None)
+        envs.sort(key=lambda e: (cat_rank(e["category"]), e["category"], e["name"].lower()))
+        meta = {
+            "tool": "pyenv-finder", "tool_version": APP_VERSION,
+            "host": socket.gethostname(), "scanned_at": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "scan_seconds": round(time.monotonic() - t0, 1),
+            "dirs_scanned": self.p.dirs, "permission_errors": self.p.errors,
+            "which": which_info(), "conda_tools_on_path": self.conda_tools,
+            "conda_installs": conda_installs(envs), "notes": self.notes,
+            "sizes": self.do_size,
+        }
+        return envs, meta
+
+    # ---- turn raw findings into environment records
+    def build(self):
+        envs = []
+        prefixes = {}  # real prefix -> env (for alias assignment)
+        # conda
+        cprefs = {}
+        for c in self.conda_prefixes:
+            cprefs.setdefault(real(c), c)
+        for rp in sorted(cprefs):
+            e = conda_env(rp, cprefs, self.conda_listed)
+            envs.append(e)
+            prefixes[rp] = e
+        for prefix, src in self.conda_missing:
+            if real(prefix) in cprefs:
+                continue
+            e = new_env(prefix, os.path.basename(prefix.rstrip("/")) or prefix, "Broken / missing")
+            e["kind"] = "conda env (missing)"
+            e["broken"] = "listed by %s but the folder no longer exists" % src
+            e["conda_name"] = e["name"]
+            e["conda_prefix"] = prefix
+            envs.append(e)
+        # venvs
+        vreal = {}
+        for v in self.venvs:
+            vreal.setdefault(real(v), v)
+        for rp in sorted(vreal):
+            if rp in prefixes:
+                continue
+            e = venv_env(rp)
+            envs.append(e)
+            prefixes[rp] = e
+        # loose interpreters grouped by real target
+        groups = {}
+        for p in sorted(self.interps):
+            rp = real(p)
+            # sandbox links (flatpak bin/python -> /usr/bin/python3 inside the sandbox) are not host aliases
+            if "/flatpak/" in p and "/flatpak/" not in rp:
+                continue
+            groups.setdefault(rp, []).append(p)
+        roots = sorted(prefixes, key=len, reverse=True)
+        for rp, aliases in sorted(groups.items()):
+            owner_env = None
+            for r in roots:
+                if inside(rp, r):
+                    owner_env = prefixes[r]
+                    break
+            if owner_env is None:
+                # aliases located inside a venv/conda (venv bin/python -> system) are not separate
+                outside = [a for a in aliases if not any(inside(real(os.path.dirname(a)), r) for r in roots)]
+                if not outside:
+                    continue
+                e = interp_env(rp, outside)
+                if e:
+                    envs.append(e)
+                continue
+            for a in aliases:
+                if not inside(real(os.path.dirname(a)), real(owner_env["path"])) and a not in owner_env["aliases"]:
+                    owner_env["aliases"].append(a)
+        # merge interp entries sharing the same exact interpreter path set (e.g. python3 & python3.12 hardlinks)
+        for e in envs:
+            finish(e)
+        return envs
+
+    def fill_versions(self, envs):
+        todo = [e for e in envs if not e["version"] and e["python"] and not e["broken"]]
+        if self.run_python:
+            def job(e):
+                rc, out, err = run_cmd([e["python"], "--version"], timeout=5)
+                txt = (out + " " + err).strip()
+                m = re.search(r"Python\s+(\S+)", txt)
+                if m:
+                    e["version"] = m.group(1)
+                    e["version_source"] = "ran '%s --version'" % os.path.basename(e["python"])
+                elif rc is None and err == "timeout":
+                    e["problems"].append("'--version' timed out")
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                for i, _ in enumerate(ex.map(job, todo)):
+                    self.p.tick("python --version (%d/%d)" % (i + 1, len(todo)))
+        for e in envs:
+            if not e["version"]:
+                v = version_from_layout(e)
+                if v:
+                    e["version"] = v
+                    e["version_source"] = "guessed from lib/python%s folder" % v
+
+    def fill_sizes(self, envs):
+        self.p.phase = "measuring sizes"
+        done = [0]
+
+        def job(e):
+            total, timed_out = 0, False
+            for root, excl in e.pop("_size_roots", []):
+                n, to = du(root, excl, self.size_budget)
+                total += n
+                timed_out = timed_out or to
+            e["size_bytes"] = total
+            e["size_partial"] = timed_out
+            extra = e.pop("_extra_size", None)
+            if extra:
+                label, path = extra
+                n, _ = du(path, (), self.size_budget)
+                e["extra"].append("%s: %s (%s, not included above)" % (label, human(n), tilde(path)))
+            done[0] += 1
+            self.p.tick("size: " + tilde(e["path"]))
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(job, envs))
+        for e in envs:
+            e.pop("_size_roots", None)
+            e.pop("_extra_size", None)
+
+
+def _is_file(e):
+    try:
+        return e.is_file()
+    except OSError:
+        return False
+
+
+def _is_dir(e):
+    try:
+        return e.is_dir()
+    except OSError:
+        return False
+
+
+def du(path, exclude=(), budget=25.0):
+    """Disk usage in bytes, like 'du -s', never following symlinks."""
+    total, seen = 0, set()
+    start = time.monotonic()
+    exclude = set(exclude)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0, False
+    if not stat.S_ISDIR(st.st_mode):
+        return st.st_blocks * 512, False
+    stack = [path]
+    while stack:
+        if time.monotonic() - start > budget:
+            return total, True
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for e in it:
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        if e.path not in exclude:
+                            stack.append(e.path)
+                        continue
+                    if st.st_nlink > 1:
+                        k = (st.st_dev, st.st_ino)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                    total += st.st_blocks * 512
+        except OSError:
+            continue
+    return total, False
+
+
+# ----------------------------------------------------------- env records
+def new_env(path, name, category):
+    return {
+        "name": name, "category": category, "kind": "", "path": path, "python": "",
+        "aliases": [], "version": "", "version_source": "", "size_bytes": None,
+        "size_partial": False, "pip_packages": 0, "conda_packages": None,
+        "packages": [], "notable": [], "owner": "", "program_hint": "",
+        "conda_name": "", "conda_prefix": "", "conda_base": "", "how_to_use": [],
+        "on_path": [], "broken": "", "problems": [], "extra": [],
+        "_size_roots": [(path, ())],
+    }
+
+
+def find_python(prefix):
+    for rel in ("bin/python3", "bin/python", "python3", "python", "bin/python2"):
+        p = os.path.join(prefix, rel)
+        if os.path.lexists(p):
+            return p
+    for p in sorted(glob.glob(os.path.join(glob.escape(prefix), "bin", "python[0-9]*"))):
+        if PY_RE.match(os.path.basename(p)):
+            return p
+    return ""
+
+
+def conda_flavor(root):
+    low = root.lower()
+    if "jupyterlab-desktop" in low or "jlab_server" in low:
+        return "JupyterLab Desktop (bundled conda)"
+    if "anaconda" in low:
+        return "Anaconda"
+    if "miniconda" in low:
+        return "Miniconda"
+    if "miniforge" in low or "mambaforge" in low:
+        return "Miniforge"
+    if "micromamba" in low or "/mamba" in low:
+        return "Micromamba"
+    try:
+        metas = os.listdir(os.path.join(root, "conda-meta"))
+    except OSError:
+        metas = []
+    if any(re.match(r"^(anaconda-(\d{4}\.|custom|navigator)|_anaconda_depends)", m) for m in metas):
+        return "Anaconda"
+    if any(m.startswith("conda-") for m in metas):
+        rc = read_text(os.path.join(root, ".condarc"))
+        if "conda-forge" in rc and "anaconda.com" not in rc:
+            return "Miniforge"
+        if any(m.startswith("anaconda-anon-usage") for m in metas) or "anaconda.com" in rc:
+            return "Miniconda"
+        return "Conda"
+    if os.path.exists(os.path.join(root, "bin", "micromamba")):
+        return "Micromamba"
+    return "Conda"
+
+
+def meta_version(prefix, pkg):
+    for f in glob.glob(os.path.join(glob.escape(prefix), "conda-meta", pkg + "-[0-9]*.json")):
+        m = re.match(re.escape(pkg) + r"-(\d[^-]*)-", os.path.basename(f))
+        if m:
+            return m.group(1)
+    return ""
+
+
+def conda_root_of(rp, cprefs, listed):
+    if isdir(os.path.join(rp, "condabin")) or is_exec_file(os.path.join(rp, "bin", "conda")) \
+            or is_exec_file(os.path.join(rp, "bin", "micromamba")):
+        return rp
+    parent = os.path.dirname(rp)
+    if os.path.basename(parent) == "envs" and isdir(os.path.join(os.path.dirname(parent), "conda-meta")):
+        return os.path.dirname(parent)
+    if rp in listed:
+        return listed[rp]
+    parent = os.path.dirname(rp)
+    if os.path.basename(parent) == "envs":
+        gp = os.path.dirname(parent)
+        if isdir(os.path.join(gp, "conda-meta")) or "mamba" in gp.lower():
+            return gp
+        if "jupyterlab-desktop" in gp:
+            js = os.path.join(gp, "jlab_server")
+            if isdir(js):
+                return real(js)
+        return gp
+    return rp
+
+
+def conda_env(rp, cprefs, listed):
+    root = conda_root_of(rp, cprefs, listed)
+    flavor = conda_flavor(root)
+    is_base = (root == rp)
+    name = "base" if is_base and (isdir(os.path.join(rp, "condabin")) or
+                                  is_exec_file(os.path.join(rp, "bin", "conda")) or
+                                  isdir(os.path.join(rp, "envs"))) else os.path.basename(rp)
+    e = new_env(rp, name, "Conda · %s · %s" % (flavor, tilde(root)))
+    e["kind"] = "conda base install" if name == "base" else "conda env"
+    e["conda_name"] = name
+    e["conda_prefix"] = rp
+    e["conda_base"] = root
+    e["conda_flavor"] = flavor
+    e["python"] = find_python(rp)
+    e["version"] = meta_version(rp, "python")
+    if e["version"]:
+        e["version_source"] = "conda-meta"
+    try:
+        e["conda_packages"] = len([m for m in os.listdir(os.path.join(rp, "conda-meta")) if m.endswith(".json")])
+    except OSError:
+        pass
+    if name == "base":
+        excl = tuple(os.path.join(rp, x) for x in ("envs", "pkgs"))
+        e["_size_roots"] = [(rp, excl)]
+        if isdir(os.path.join(rp, "pkgs")):
+            e["_extra_size"] = ("package cache (pkgs)", os.path.join(rp, "pkgs"))
+        cv = meta_version(rp, "conda")
+        mv = meta_version(rp, "mamba") or meta_version(rp, "libmamba")
+        if cv:
+            e["extra"].append("conda version: %s" % cv)
+        if mv:
+            e["extra"].append("mamba/libmamba version: %s" % mv)
+        if os.path.exists(os.path.join(rp, "bin", "micromamba")):
+            e["extra"].append("micromamba binary present")
+    if not e["python"]:
+        e["problems"].append("no Python installed in this conda env")
+    return e
+
+
+def parse_cfg(path):
+    d = {}
+    for line in read_text(path).splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k.strip().lower()] = v.strip()
+    return d
+
+
+def venv_env(rp):
+    cfg = parse_cfg(os.path.join(rp, "pyvenv.cfg"))
+    base = os.path.basename(rp)
+    parent = os.path.dirname(rp)
+    name = base
+    if base in (".venv", "venv", "env", ".env", "virtualenv", ".virtualenv") or base.startswith(".venv"):
+        name = "%s/%s" % (os.path.basename(parent), base)
+    pipx_root = os.path.join(HOME, ".local/share/pipx/venvs")
+    uvtool_root = os.path.join(HOME, ".local/share/uv/tools")
+    if inside(rp, pipx_root) and rp != pipx_root:
+        cat, kind = "pipx app environments", "pipx venv"
+    elif inside(rp, uvtool_root):
+        cat, kind = "uv tool environments", "uv tool venv"
+    else:
+        cat = "Virtual environments (venv / virtualenv / uv)"
+        kind = "uv venv" if "uv" in cfg else ("virtualenv" if "virtualenv" in cfg else "venv")
+        if inside(rp, os.path.join(HOME, ".local/share/virtualenvs")):
+            kind = "pipenv venv"
+        if inside(rp, os.path.join(HOME, ".local/share/hatch")):
+            kind = "hatch venv"
+    e = new_env(rp, name, cat)
+    e["kind"] = kind
+    e["python"] = find_python(rp)
+    v = cfg.get("version") or cfg.get("version_info")
+    if v:
+        e["version"] = v
+        e["version_source"] = "pyvenv.cfg"
+    home = cfg.get("home", "")
+    e["extra"].append("base interpreter (home): %s" % (cfg.get("executable") or home or "?"))
+    if cfg.get("include-system-site-packages", "").lower() == "true":
+        e["extra"].append("can also see the base interpreter's packages (include-system-site-packages = true)")
+    if cfg.get("prompt"):
+        e["extra"].append("prompt: %s" % cfg["prompt"])
+    if not e["python"]:
+        e["broken"] = "no python inside bin/"
+    elif not os.path.exists(e["python"]):
+        e["broken"] = "bin/%s is a dead link -> %s" % (os.path.basename(e["python"]), safe(os.readlink(e["python"])) if os.path.islink(e["python"]) else "?")
+    elif home and not isdir(home):
+        e["broken"] = "base interpreter folder %s no longer exists" % home
+    return e
+
+
+def interp_env(rp, aliases):
+    """A plain interpreter (not venv/conda): system, uv, pyenv, flatpak, /opt app..."""
+    exists = os.path.exists(rp)
+    bindir = os.path.dirname(rp)
+    prefix = os.path.dirname(bindir) if os.path.basename(bindir) in ("bin", "sbin") else bindir
+    nm = os.path.basename(rp)
+    shared_prefix = prefix in ("/", "/usr", "/usr/local", HOME, os.path.join(HOME, ".local"))
+    uvp = os.path.join(HOME, ".local/share/uv/python")
+    pyenvp = os.path.join(HOME, ".pyenv/versions")
+    if not exists:
+        e = new_env(aliases[0], nm, "Broken / missing")
+        e["kind"] = "dead link"
+        e["broken"] = "link points to missing file %s" % rp
+        e["python"] = aliases[0]
+        e["aliases"] = aliases
+        e["_size_roots"] = []
+        return e
+    if is_exec_file(rp) is False:
+        return None
+    if prefix in ("/usr", "/"):
+        cat, kind, name = "System Python (/usr/bin, from apt)", "system interpreter", nm
+    elif prefix == "/usr/local":
+        cat, kind, name = "Locally installed (/usr/local)", "self-built / make install", nm
+    elif inside(rp, uvp):
+        cat, kind = "uv-managed Pythons", "uv python install"
+        name = os.path.relpath(rp, uvp).split("/")[0]
+        prefix = os.path.join(uvp, name)
+    elif inside(rp, pyenvp):
+        cat, kind = "pyenv versions", "pyenv build"
+        name = os.path.relpath(rp, pyenvp).split("/")[0]
+        prefix = os.path.join(pyenvp, name)
+    elif rp.startswith("/var/lib/flatpak/") or inside(rp, os.path.join(HOME, ".local/share/flatpak")):
+        cat, kind = "Flatpak apps & runtimes (bundled Python)", "flatpak"
+        m = re.search(r"/(app|runtime)/([^/]+)/[^/]+/([^/]+)/", rp)
+        name = "%s (%s)" % (m.group(2), m.group(3)) if m else nm
+        kind = "flatpak %s" % (m.group(1) if m else "")
+        prefix = re.sub(r"/[0-9a-f]{40,64}/files", "/active/files", prefix)
+    elif re.search(r"/(umu|steamrt\d*|SteamLinuxRuntime[^/]*|[Pp]roton[^/]*|\.wine[^/]*|Bottles|bottles)/", rp + "/"):
+        cat, kind = "Game runtimes (Steam / Proton / umu / Wine - ignorable)", "game runtime"
+        m = re.search(r"/(steamrt\d*|SteamLinuxRuntime[^/]*|[Pp]roton[^/]*)", rp)
+        name = "%s: %s" % (m.group(1) if m else "runtime", nm)
+    elif rp.startswith("/snap/"):
+        cat, kind = "Snap packages (bundled Python)", "snap"
+        name = rp.split("/")[2]
+    elif rp.startswith("/opt/"):
+        cat, kind = "Application-bundled Pythons", "bundled in /opt"
+        name = "%s: %s" % (rp.split("/")[2], nm)
+    else:
+        cat, kind = "Application-bundled Pythons", "bundled interpreter"
+        name = "%s: %s" % (os.path.basename(prefix) or prefix, nm)
+    e = new_env(prefix, name, cat)
+    e["kind"] = kind
+    e["python"] = rp
+    e["aliases"] = [a for a in aliases if a != rp]
+    m = re.match(r"python(\d+\.\d+)$", nm)
+    if shared_prefix:
+        roots = [(rp, ())]
+        if m:
+            for lib in ("lib/python%s" % m.group(1),):
+                p = os.path.join(prefix, lib)
+                if isdir(p):
+                    roots.append((p, ()))
+        e["_size_roots"] = roots
+        e["_shared"] = True
+    return e
+
+
+def site_dirs(e):
+    p = e["path"]
+    out = []
+    if e.get("_shared"):
+        m = re.match(r"python(\d+\.\d+)$", os.path.basename(e["python"]))
+        vv = m.group(1) if m else (".".join(e["version"].split(".")[:2]) if e["version"] else "")
+        if p == "/usr":
+            out += ["/usr/lib/python3/dist-packages"]
+            if vv:
+                out += ["/usr/lib/python%s/site-packages" % vv, "/usr/local/lib/python%s/dist-packages" % vv]
+        elif vv:
+            out += [os.path.join(p, "lib/python%s/site-packages" % vv)]
+    else:
+        for pat in ("lib/python*/site-packages", "lib64/python*/site-packages",
+                    "lib/python3/dist-packages", "Lib/site-packages", "lib/site-packages",
+                    "usr/lib/python*/site-packages", "*/lib/python*/site-packages"):
+            out += glob.glob(os.path.join(glob.escape(p), pat))
+    seen, res = set(), []
+    for d in out:
+        r = real(d)
+        if r not in seen and isdir(d):
+            seen.add(r)
+            res.append(d)
+    return res
+
+
+DIST_RE = re.compile(r"^(.+?)-(\d[^-]*?)?(-py[\d.]+)?\.(dist-info|egg-info)$")
+
+
+def scan_packages(e):
+    pk = {}
+    for d in site_dirs(e):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if n.endswith(".dist-info") or n.endswith(".egg-info"):
+                m = DIST_RE.match(n)
+                if m:
+                    nm, ver = m.group(1), m.group(2) or ""
+                else:
+                    nm, ver = n.rsplit(".", 1)[0], ""
+                key = re.sub(r"[-_.]+", "-", nm).lower()
+                pk.setdefault(key, ver)
+    e["site_packages_dirs"] = site_dirs(e)
+    e["pip_packages"] = len(pk)
+    e["packages"] = ["%s %s" % (k, v) if v else k for k, v in sorted(pk.items())]
+    e["notable"] = ["%s %s" % (k, pk[k]) if pk[k] else k for k in NOTABLE if k in pk]
+    hints = [v for k, v in PROGRAM_PACKAGES.items() if k in pk]
+    e["_pkgset"] = pk
+    return hints
+
+
+def owner_of(e):
+    p = e["path"]
+    parts = p.split("/")
+    m = re.search(r"/\.var/app/([^/]+)/", p + "/")
+    if "jupyterlab-desktop" in p:
+        app = "JupyterLab Desktop"
+        if m:
+            app += " (flatpak %s)" % m.group(1)
+        if "jlab_server" in p:
+            return app + " - its built-in Python server environment (jlab_server)"
+        return app + " - an environment it created"
+    if m:
+        return "Flatpak app %s (stored in its private data folder)" % m.group(1)
+    m = re.search(r"/flatpak/(app|runtime)/([^/]+)/", p)
+    if m:
+        return "Flatpak %s %s" % (m.group(1), m.group(2))
+    if inside(p, os.path.join(HOME, ".local/share/pipx/venvs")):
+        meta = os.path.join(p, "pipx_metadata.json")
+        try:
+            with open(meta, encoding="utf-8", errors="replace") as f:
+                mp = json.load(f).get("main_package", {})
+            return "pipx app '%s' %s" % (mp.get("package", os.path.basename(p)), mp.get("package_version", ""))
+        except (OSError, ValueError, AttributeError):
+            return "pipx app '%s'" % os.path.basename(p)
+    if inside(p, os.path.join(HOME, ".local/share/uv/tools")):
+        return "uv tool '%s'" % os.path.basename(p)
+    if inside(p, os.path.join(HOME, ".local/share/uv/python")):
+        return "uv (Python installed by 'uv python install' or 'uv venv')"
+    if re.search(r"/(umu|steamrt\d*|SteamLinuxRuntime[^/]*|[Pp]roton[^/]*)/", p + "/"):
+        return "Steam / umu-launcher game runtime (used to run games; ignorable)"
+    if inside(p, os.path.join(HOME, ".local/share/pipx/shared")):
+        return "pipx itself (shared pip used by all pipx apps)"
+    if "mycroft" in p.lower():
+        return "Mycroft voice assistant (see also /opt/mycroft)" if isdir("/opt/mycroft") else "Mycroft voice assistant"
+    if "open-webui" in p.lower() or "open_webui" in p.lower():
+        return "Open WebUI"
+    if p.startswith("/opt/") and len(parts) > 2:
+        return "program in /opt/%s" % parts[2]
+    if p.startswith("/snap/"):
+        return "snap %s" % parts[2]
+    if inside(p, os.path.join(HOME, ".vscode/extensions")) or inside(p, os.path.join(HOME, ".vscode-oss/extensions")):
+        return "VS Code extension %s" % p.split("/extensions/")[1].split("/")[0]
+    if inside(p, os.path.join(HOME, ".local/share/virtualenvs")):
+        return "pipenv project %s" % os.path.basename(p).rsplit("-", 1)[0]
+    if e.get("conda_name"):
+        fl = e.get("conda_flavor", "conda")
+        if e["conda_name"] == "base":
+            return "%s - base (root) environment" % fl
+        return "%s - conda env '%s'" % (fl, e["conda_name"])
+    if e["category"].startswith("System"):
+        return "Linux Mint / Ubuntu (apt package python%s)" % (".".join(e["version"].split(".")[:2]) or "3")
+    if e["kind"] in ("venv", "virtualenv", "uv venv"):
+        proj = os.path.dirname(p) if os.path.basename(p).startswith((".venv", "venv", "env", ".env")) else p
+        return "project folder %s" % tilde(proj)
+    return ""
+
+
+def how_to_use(e):
+    py = e["python"] or os.path.join(e["path"], "bin/python")
+    k, c = e["kind"], e["category"]
+    if e["broken"]:
+        return ["This environment is broken; it cannot be used as is."]
+    if e.get("conda_name"):
+        base = e["conda_base"]
+        conda = os.path.join(base, "condabin/conda") if isdir(os.path.join(base, "condabin")) else os.path.join(base, "bin/conda")
+        tips = ["conda activate %s" % (e["conda_name"] if e["conda_name"] != "base" or True else ""),
+                "or by prefix: conda activate %s" % e["path"],
+                "run directly without activating: %s" % py]
+        if "JupyterLab" in e.get("conda_flavor", ""):
+            tips.insert(0, "Used automatically by JupyterLab Desktop (manage it in the app: Settings > Manage Python environments).")
+            tips[1] = "conda activate %s   (with JupyterLab's conda: %s)" % (e["path"], tilde(conda))
+        else:
+            tips.append("this install's conda: %s" % tilde(conda))
+        return tips
+    if k == "pipx venv":
+        n = os.path.basename(e["path"])
+        return ["Managed by pipx - use the app's command (e.g. '%s')." % n, "list its packages: pipx runpip %s list" % n,
+                "upgrade: pipx upgrade %s   (pyenv-finder itself never runs this)" % n]
+    if k == "uv tool venv":
+        return ["Managed by uv - run the tool's command; 'uv tool list' shows tools."]
+    if k in ("venv", "virtualenv", "uv venv", "pipenv venv", "hatch venv"):
+        return ["source %s/bin/activate" % tilde(e["path"]), "leave with: deactivate", "or run directly: %s" % tilde(py)]
+    if c.startswith("System"):
+        return ["Run: %s   (used by the operating system - don't 'pip install' into it; use a venv)" % os.path.basename(py),
+                "make a venv: %s -m venv ~/myproject/.venv" % py]
+    if c.startswith("uv"):
+        return ["uv run --python %s script.py" % (e["version"] or "3.x"),
+                "uv venv --python %s   (creates a venv that uses it)" % (e["version"] or "3.x"),
+                "or run directly: %s" % tilde(py)]
+    if c.startswith("pyenv"):
+        return ["pyenv shell %s" % e["name"], "or: pyenv global/local %s" % e["name"]]
+    if c.startswith("Flatpak"):
+        m = re.search(r"/(?:app|runtime)/([^/]+)/", e["path"])
+        return ["Private to the flatpak; it runs inside the sandbox: flatpak run %s" % (m.group(1) if m else "<app-id>")]
+    return ["Part of a program; normally used only by that program.", "run directly: %s" % tilde(py)]
+
+
+def version_from_layout(e):
+    for pat in ("lib/python[0-9]*.*", "lib64/python[0-9]*.*", "*/lib/python[0-9]*.*"):
+        for d in sorted(glob.glob(os.path.join(glob.escape(e["path"]), pat))):
+            m = re.search(r"python(\d+\.\d+)$", d)
+            if m and not e.get("_shared"):
+                return m.group(1)
+    m = re.search(r"python(\d+\.\d+)$", os.path.basename(e["python"] or ""))
+    return m.group(1) if m else ""
+
+
+def finish(e):
+    hints = []
+    if not e["broken"]:
+        hints = scan_packages(e)
+    else:
+        e["site_packages_dirs"] = []
+    e["_hints"] = hints
+    e["_pk"] = e.get("_pkgset", {})
+
+
+def finalize(e):
+    hints = e.pop("_hints", [])
+    e["_pkgset"] = e.pop("_pk", {})
+    e["owner"] = owner_of(e)
+    if not e["owner"] and hints:
+        e["owner"] = hints[0]
+    pk = e.pop("_pkgset", {})
+    if hints:
+        e["program_hint"] = ", ".join(hints)
+    if "open-webui" in pk and "Open WebUI" not in e["owner"]:
+        e["owner"] += (" / " if e["owner"] else "") + "Open WebUI"
+    if e["category"].startswith("System") and e["python"]:
+        m = re.match(r"python(\d+\.\d+)$", os.path.basename(e["python"]))
+        if m:
+            us = os.path.join(HOME, ".local/lib/python%s/site-packages" % m.group(1))
+            if isdir(us):
+                try:
+                    n = len([x for x in os.listdir(us) if x.endswith((".dist-info", ".egg-info"))])
+                except OSError:
+                    n = 0
+                e["extra"].append("user packages (pip install --user) in %s: %d" % (tilde(us), n))
+    e["how_to_use"] = how_to_use(e)
+
+
+def which_info():
+    out = {}
+    for n in ("python", "python3", "pip", "pip3", "conda", "mamba", "micromamba", "uv", "pipx", "jupyter"):
+        allm = []
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            p = os.path.join(d or ".", n)
+            if is_exec_file(p) and p not in allm:
+                allm.append(p)
+        if allm:
+            out[n] = {"first": allm[0], "real": real(allm[0]), "all": allm}
+    return out
+
+
+def mark_path(envs):
+    w = which_info()
+    for n in ("python", "python3"):
+        if n not in w:
+            continue
+        first, rp = w[n]["first"], w[n]["real"]
+        fdir = real(os.path.dirname(first))
+        best = None
+        for e in envs:
+            if e["broken"]:
+                continue
+            bindir = real(os.path.join(e["path"], "bin"))
+            if fdir == bindir or (e.get("conda_prefix") and fdir == real(e["path"])):
+                best = e
+                break
+        if best is None:
+            for e in envs:
+                if e["python"] and real(e["python"]) == rp and not e["kind"].endswith("venv") and e["kind"] not in ("venv", "virtualenv"):
+                    best = e
+                    break
+        if best is not None:
+            best["on_path"].append(n)
+
+
+def conda_installs(envs):
+    res = {}
+    for e in envs:
+        if e.get("conda_base"):
+            r = res.setdefault(e["conda_base"], {"root": e["conda_base"], "flavor": e.get("conda_flavor"),
+                                                 "envs": []})
+            r["envs"].append({"name": e["conda_name"], "prefix": e["conda_prefix"], "python": e["version"]})
+    return list(res.values())
+
+
+def cat_rank(c):
+    for i, k in enumerate(CAT_ORDER):
+        if c.startswith(k):
+            return i
+    return len(CAT_ORDER)
+
+
+# ------------------------------------------------------------ text output
+def flags(e):
+    f = []
+    if e["on_path"]:
+        f.append("ON PATH as " + "/".join(e["on_path"]))
+    if e["broken"]:
+        f.append("BROKEN")
+    return f
+
+
+def size_str(e):
+    if e["size_bytes"] is None:
+        return "-"
+    return ("≥" if e["size_partial"] else "") + human(e["size_bytes"])
+
+
+def pkg_str(e):
+    s = "%d pkgs" % e["pip_packages"]
+    if e["conda_packages"] is not None:
+        s += " (conda %d)" % e["conda_packages"]
+    return s
+
+
+def group(envs):
+    out = []
+    for e in envs:
+        if not out or out[-1][0] != e["category"]:
+            out.append((e["category"], []))
+        out[-1][1].append(e)
+    return out
+
+
+def render_list(envs, meta):
+    L = []
+    L.append("pyenv-finder %s - Python environments on %s  (%s, %s s)" % (
+        APP_VERSION, meta["host"], meta["scanned_at"], meta["scan_seconds"]))
+    L.append(READ_ONLY_NOTE)
+    w = meta["which"]
+    for n in ("python", "python3", "conda"):
+        if n in w:
+            L.append("  which %-8s -> %s%s" % (n, tilde(w[n]["first"]),
+                                              "" if w[n]["real"] == w[n]["first"] else "  (-> %s)" % tilde(w[n]["real"])))
+    ci = meta.get("conda_installs", [])
+    fl = [c["flavor"] for c in ci]
+    L.append("  Conda installs: %s" % ("; ".join("%s at %s (%d env%s)" % (c["flavor"], tilde(c["root"]), len(c["envs"]),
+                                                                        "" if len(c["envs"]) == 1 else "s") for c in ci) or "none"))
+    missing = [f for f in ("Anaconda", "Miniconda", "Miniforge", "Micromamba") if f not in fl]
+    if missing:
+        L.append("  Not installed : %s" % ", ".join(missing))
+    L.append("  Found %d environments/interpreters in %d categories." % (len(envs), len(group(envs))))
+    for cat, items in group(envs):
+        L.append("")
+        L.append("== %s  (%d) ==" % (cat, len(items)))
+        for e in items:
+            star = "*" if e["on_path"] else ("!" if e["broken"] else " ")
+            L.append(" %s %-34s %-9s %10s  %-18s %s" % (
+                star, safe(e["name"])[:34], e["version"] or "?", size_str(e), pkg_str(e),
+                "  ".join(flags(e))))
+            L.append("      path : %s" % safe(tilde(e["path"])))
+            if e.get("conda_name"):
+                L.append("      conda: name '%s', prefix %s" % (e["conda_name"], safe(e["conda_prefix"])))
+            if e["owner"]:
+                L.append("      owner: %s" % safe(e["owner"]))
+            if e["notable"]:
+                L.append("      notable: %s" % ", ".join(e["notable"]))
+            if e["broken"]:
+                L.append("      BROKEN: %s" % safe(e["broken"]))
+    if meta.get("notes"):
+        L.append("")
+        L += ["note: " + n for n in meta["notes"]]
+    L.append("")
+    L.append("Legend: * = the 'python'/'python3' you get when typing it in a terminal, ! = broken")
+    return "\n".join(L) + "\n"
+
+
+def render_json(envs, meta):
+    return json.dumps({"meta": meta, "environments": envs}, indent=2, ensure_ascii=False,
+                      default=str)
+
+
+def export(envs, meta):
+    with open(REPORT_TXT, "w", encoding="utf-8", errors="replace") as f:
+        f.write(render_list(envs, meta))
+    with open(REPORT_JSON, "w", encoding="utf-8", errors="replace") as f:
+        f.write(render_json(envs, meta))
+    return REPORT_TXT, REPORT_JSON
+
+
+def details_lines(e, meta):
+    L = []
+    L.append("%s" % e["name"])
+    L.append("=" * min(70, max(10, len(e["name"]))))
+    L.append("Category      : %s" % e["category"])
+    L.append("Type          : %s" % e["kind"])
+    L.append("Location      : %s" % e["path"])
+    L.append("Interpreter   : %s" % (e["python"] or "(none)"))
+    for a in e["aliases"]:
+        L.append("  also as     : %s" % a)
+    L.append("Python version: %s   (%s)" % (e["version"] or "unknown", e["version_source"] or "-"))
+    if e.get("conda_name"):
+        L.append("Conda name    : %s" % e["conda_name"])
+        L.append("Conda prefix  : %s" % e["conda_prefix"])
+        L.append("Conda install : %s  (%s)" % (e["conda_base"], e.get("conda_flavor", "")))
+    L.append("Size on disk  : %s%s" % (size_str(e), "  (stopped measuring after time limit)" if e["size_partial"] else ""))
+    L.append("Packages      : %s" % pkg_str(e))
+    L.append("Owner program : %s" % (e["owner"] or "(none detected - probably made by you)"))
+    if e["program_hint"]:
+        L.append("Programs in it: %s" % e["program_hint"])
+    L.append("On PATH       : %s" % ("yes - typing %s runs this" % " / ".join(e["on_path"]) if e["on_path"] else "no"))
+    if e["broken"]:
+        L.append("BROKEN        : %s" % e["broken"])
+    for p in e["problems"]:
+        L.append("Problem       : %s" % p)
+    for x in e["extra"]:
+        L.append("Info          : %s" % x)
+    L.append("")
+    L.append("How to use it:")
+    L += ["  " + h for h in e["how_to_use"]]
+    L.append("")
+    L.append("Notable packages: %s" % (", ".join(e["notable"]) or "-"))
+    for d in e.get("site_packages_dirs", []):
+        L.append("  packages folder: %s" % d)
+    L.append("")
+    w = meta.get("which", {})
+    L.append("'which' on this computer:")
+    for n in ("python", "python3", "pip", "conda", "jupyter"):
+        if n in w:
+            L.append("  %-8s -> %s" % (n, w[n]["first"]))
+            for o in w[n]["all"][1:4]:
+                L.append("              (also %s)" % o)
+    L.append("")
+    L.append("Installed packages (%d):" % len(e["packages"]))
+    pk = e["packages"]
+    for i in range(0, len(pk), 3):
+        L.append("  " + "".join("%-30s" % p[:29] for p in pk[i:i + 3]))
+    return [safe(x) for x in L]
+
+
+# --------------------------------------------------------------- curses UI
+def run_tui(args):
+    import curses
+
+    state = {"envs": [], "meta": {}, "filter": "", "sort": 0, "sel": 0, "top": 0, "msg": ""}
+    SORTS = ["name", "size", "version"]
+
+    def do_scan(scr):
+        def cb(p, where):
+            try:
+                h, w = scr.getmaxyx()
+                scr.erase()
+                spin = "|/-\\"[int(time.monotonic() * 8) % 4]
+                scr.addstr(0, 0, safe("pyenv-finder - scanning... %s" % spin)[:w - 1], curses.A_BOLD)
+                scr.addstr(2, 0, safe("phase : %s" % p.phase)[:w - 1])
+                scr.addstr(3, 0, safe("folders looked at: %d   found: %d   unreadable: %d" % (p.dirs, p.found, p.errors))[:w - 1])
+                scr.addstr(4, 0, safe("now   : %s" % tilde(where))[:w - 1])
+                scr.addstr(h - 1, 0, READ_ONLY_NOTE[:w - 1], curses.A_DIM)
+                scr.refresh()
+            except curses.error:
+                pass
+        sc = Scanner(do_size=not args.no_size, run_python=not args.no_run, progress_cb=cb)
+        state["envs"], state["meta"] = sc.scan()
+        state["sel"] = 0
+        state["top"] = 0
+
+    def visible():
+        f = state["filter"].lower()
+        es = state["envs"]
+        if f:
+            es = [e for e in es if f in " ".join([e["name"], e["path"], e["category"], e["owner"], e["version"],
+                                                  e["kind"], " ".join(e["notable"]), e.get("conda_name", "")]).lower()]
+        s = SORTS[state["sort"]]
+        if s == "size":
+            key = lambda e: -(e["size_bytes"] or 0)
+        elif s == "version":
+            key = lambda e: tuple(-x for x in ver_key(e["version"]))
+        else:
+            key = lambda e: e["name"].lower()
+        es = sorted(es, key=lambda e: (cat_rank(e["category"]), e["category"], key(e)))
+        rows = []
+        for cat, items in group(es):
+            rows.append(("H", "%s  (%d)" % (cat, len(items))))
+            for e in items:
+                rows.append(("E", e))
+        return rows, es
+
+    def line_for(e, w):
+        mark = "*" if e["on_path"] else ("!" if e["broken"] else " ")
+        own = e["owner"] or ""
+        nb = (" [" + ", ".join(x.split(" ")[0] for x in e["notable"][:4]) + "]") if e["notable"] else ""
+        s = " %s %-28s %-9s %10s %5s  %s%s" % (mark, safe(e["name"])[:28], (e["version"] or "?")[:9],
+                                               size_str(e), e["pip_packages"], safe(own), nb)
+        return s[:w - 1]
+
+    def details(scr, e):
+        lines = details_lines(e, state["meta"])
+        top = 0
+        while True:
+            h, w = scr.getmaxyx()
+            scr.erase()
+            for i, ln in enumerate(lines[top:top + h - 2]):
+                try:
+                    scr.addstr(i, 0, ln[:w - 1], curses.A_BOLD if i + top < 2 else 0)
+                except curses.error:
+                    pass
+            try:
+                scr.addstr(h - 1, 0, ("↑↓ PgUp PgDn scroll  Esc/Enter/q back   " + READ_ONLY_NOTE)[:w - 1], curses.A_REVERSE)
+            except curses.error:
+                pass
+            scr.refresh()
+            k = scr.getch()
+            if k in (27, 10, 13, ord("q"), curses.KEY_LEFT, ord("h"), curses.KEY_BACKSPACE):
+                return
+            if k in (curses.KEY_DOWN, ord("j")):
+                top = min(top + 1, max(0, len(lines) - (h - 2)))
+            elif k in (curses.KEY_UP, ord("k")):
+                top = max(0, top - 1)
+            elif k in (curses.KEY_NPAGE, ord(" ")):
+                top = min(top + h - 3, max(0, len(lines) - (h - 2)))
+            elif k == curses.KEY_PPAGE:
+                top = max(0, top - (h - 3))
+            elif k == curses.KEY_HOME:
+                top = 0
+
+    def prompt(scr, label):
+        h, w = scr.getmaxyx()
+        buf = state["filter"]
+        curses.curs_set(1)
+        while True:
+            try:
+                scr.move(h - 1, 0)
+                scr.clrtoeol()
+                scr.addstr(h - 1, 0, (label + buf)[:w - 1])
+            except curses.error:
+                pass
+            scr.refresh()
+            k = scr.get_wch() if hasattr(scr, "get_wch") else scr.getch()
+            if k in ("\n", "\r", 10, 13, curses.KEY_ENTER):
+                break
+            if k in ("\x1b", 27):
+                buf = state["filter"]
+                break
+            if k in (curses.KEY_BACKSPACE, "\x7f", "\b", 127, 8):
+                buf = buf[:-1]
+            elif isinstance(k, str) and k.isprintable():
+                buf += k
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        return buf
+
+    def main(scr):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        curses.use_default_colors() if curses.has_colors() else None
+        if curses.has_colors():
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_RED, -1)
+            curses.init_pair(3, curses.COLOR_GREEN, -1)
+        scr.keypad(True)
+        do_scan(scr)
+        while True:
+            rows, es = visible()
+            sel_rows = [i for i, r in enumerate(rows) if r[0] == "E"]
+            if sel_rows:
+                state["sel"] = max(0, min(state["sel"], len(sel_rows) - 1))
+            h, w = scr.getmaxyx()
+            body = max(1, h - 4)
+            cur = sel_rows[state["sel"]] if sel_rows else 0
+            if cur < state["top"]:
+                state["top"] = max(0, cur - 1 if cur > 0 and rows[cur - 1][0] == "H" else cur)
+            if cur >= state["top"] + body:
+                state["top"] = cur - body + 1
+            scr.erase()
+            hdr = "pyenv-finder  %d envs  sort:%s  filter:%s" % (len(es), SORTS[state["sort"]], state["filter"] or "-")
+            w0 = state["meta"].get("which", {}).get("python3")
+            if w0:
+                hdr += "   python3 -> %s" % tilde(w0["first"])
+            try:
+                scr.addstr(0, 0, safe(hdr)[:w - 1], curses.A_BOLD)
+                scr.addstr(1, 0, ("   %-28s %-9s %10s %5s  %s" % ("NAME", "VERSION", "SIZE", "PKGS", "OWNER PROGRAM [notable]"))[:w - 1], curses.A_UNDERLINE)
+            except curses.error:
+                pass
+            for i, r in enumerate(rows[state["top"]:state["top"] + body]):
+                y = 2 + i
+                idx = state["top"] + i
+                try:
+                    if r[0] == "H":
+                        scr.addstr(y, 0, safe("▸ " + r[1])[:w - 1], curses.A_BOLD | (curses.color_pair(1) if curses.has_colors() else 0))
+                    else:
+                        e = r[1]
+                        attr = curses.A_REVERSE if idx == cur else 0
+                        if e["broken"] and curses.has_colors():
+                            attr |= curses.color_pair(2)
+                        elif e["on_path"] and curses.has_colors():
+                            attr |= curses.color_pair(3)
+                        scr.addstr(y, 0, line_for(e, w), attr)
+                except curses.error:
+                    pass
+            if not rows:
+                try:
+                    scr.addstr(3, 2, "Nothing matches the filter. Press / and clear it.")
+                except curses.error:
+                    pass
+            foot = "↑↓/jk move Enter details / filter s sort r rescan e export q quit | " + READ_ONLY_NOTE
+            try:
+                if state["msg"]:
+                    scr.addstr(h - 2, 0, safe(state["msg"])[:w - 1], curses.A_BOLD)
+                elif sel_rows:
+                    se = rows[cur][1]
+                    info = ("conda '%s' prefix: %s" % (se["conda_name"], se["conda_prefix"])) if se.get("conda_name") \
+                        else ("path: %s" % tilde(se["path"]))
+                    scr.addstr(h - 2, 0, safe(info)[:w - 1], curses.A_DIM)
+                scr.addstr(h - 1, 0, foot[:w - 1], curses.A_REVERSE)
+            except curses.error:
+                pass
+            scr.refresh()
+            k = scr.getch()
+            state["msg"] = ""
+            if k in (ord("q"), ord("Q")):
+                return
+            elif k in (curses.KEY_DOWN, ord("j")):
+                state["sel"] += 1
+            elif k in (curses.KEY_UP, ord("k")):
+                state["sel"] = max(0, state["sel"] - 1)
+            elif k == curses.KEY_NPAGE:
+                state["sel"] += body - 2
+            elif k == curses.KEY_PPAGE:
+                state["sel"] = max(0, state["sel"] - (body - 2))
+            elif k in (curses.KEY_HOME, ord("g")):
+                state["sel"] = 0
+            elif k in (curses.KEY_END, ord("G")):
+                state["sel"] = len(sel_rows) - 1
+            elif k in (10, 13, curses.KEY_ENTER, curses.KEY_RIGHT, ord("l")) and sel_rows:
+                details(scr, rows[cur][1])
+            elif k == ord("/"):
+                state["filter"] = prompt(scr, "filter (Enter=apply, empty=clear, Esc=cancel): ").strip()
+                state["sel"] = 0
+                state["top"] = 0
+            elif k == ord("s"):
+                state["sort"] = (state["sort"] + 1) % len(SORTS)
+                state["msg"] = "sorted by %s (inside each category)" % SORTS[state["sort"]]
+            elif k == ord("r"):
+                do_scan(scr)
+                state["msg"] = "rescan finished"
+            elif k == ord("e"):
+                try:
+                    t, j = export(es, state["meta"])
+                    state["msg"] = "exported %d entries to %s and %s" % (len(es), tilde(t), tilde(j))
+                except OSError as ex:
+                    state["msg"] = "export failed: %s" % ex
+
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(main)
+
+
+# --------------------------------------------------------------------- main
+HELP_EPILOG = """\
+Interactive keys:  Up/Down or j/k move, Enter details, / filter, s sort
+                   (name/size/version), r rescan, e export, q quit.
+Without --list/--json and without a terminal, --list is used automatically.
+Reports written by 'e' / --export: ~/pyenv-finder-report.txt and .json
+pyenv-finder is READ-ONLY: it never modifies, deletes or installs anything.
+Manual: ~/Documents/pyenv-finder-MANUAL.md
+"""
+
+
+def main():
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    ap = argparse.ArgumentParser(
+        prog="pyenv-finder", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Find and categorise all Python environments and interpreters on this computer "
+                    "(system, conda/Anaconda/Miniconda/mamba, venv, pipx, uv, pyenv, flatpak, apps).",
+        epilog=HELP_EPILOG)
+    ap.add_argument("--list", action="store_true", help="print a plain text list grouped by category")
+    ap.add_argument("--json", action="store_true", help="print everything as JSON")
+    ap.add_argument("--export", action="store_true", help="scan and write ~/pyenv-finder-report.txt and .json")
+    ap.add_argument("--no-size", action="store_true", help="skip measuring disk size (much faster)")
+    ap.add_argument("--no-run", action="store_true", help="never run any interpreter (versions from files only)")
+    ap.add_argument("--version", action="version", version="pyenv-finder " + APP_VERSION)
+    args = ap.parse_args()
+
+    interactive = not (args.list or args.json or args.export)
+    if interactive:
+        if sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb":
+            try:
+                run_tui(args)
+                return 0
+            except KeyboardInterrupt:
+                return 130
+            except Exception as ex:  # curses not usable -> fall back
+                sys.stderr.write("pyenv-finder: terminal UI failed (%s); showing --list instead\n" % ex)
+        args.list = True
+
+    show = sys.stderr.isatty()
+
+    def cb(p, where):
+        if show:
+            msg = "\r[%s] %d folders, %d found: %s" % (p.phase[:22], p.dirs, p.found, tilde(where))
+            cols = shutil.get_terminal_size((80, 20)).columns
+            sys.stderr.write(safe(msg)[:cols - 1].ljust(cols - 1))
+            sys.stderr.flush()
+    try:
+        envs, meta = Scanner(do_size=not args.no_size, run_python=not args.no_run, progress_cb=cb).scan()
+    except KeyboardInterrupt:
+        sys.stderr.write("\ninterrupted\n")
+        return 130
+    if show:
+        sys.stderr.write("\r" + " " * (shutil.get_terminal_size((80, 20)).columns - 1) + "\r")
+    if args.export:
+        t, j = export(envs, meta)
+        print("wrote %s and %s" % (t, j))
+    if args.json:
+        print(render_json(envs, meta))
+    elif args.list:
+        sys.stdout.write(render_list(envs, meta))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
